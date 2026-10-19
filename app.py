@@ -1,6 +1,6 @@
 """
 TicketPulse IT - Ticket Telemetry & Integrity Audit
-Requires: streamlit>=1.40, pandas, numpy, openpyxl
+Requires: streamlit>=1.40, pandas, numpy, openpyxl (CSV supported too)
 Run:      streamlit run app.py
 """
 import hashlib
@@ -28,9 +28,9 @@ PAGE_SIZE = 6
 STRETCH = {"width": "stretch"} if "width" in inspect.signature(st.button).parameters else {"use_container_width": True}
 
 NAV = ["Overview & Fraud Matrix", "Live Ticket Stream", "Agent Audit", "Rules Engine", "Reports"]
-TAGS = ["Fast-Closed", "Self-Assigned", "Generic Solution", "Missing Solution"]
+TAGS = ["Fast-Closed", "Self-Assigned", "Generic Solution", "Solution Mismatch", "Missing Solution"]
 TAB_LABELS = {"all": "All Flagged", "Fast-Closed": "Closed < 30s",
-              "Self-Assigned": "Self-Assigned", "Generic Solution": "Generic Solution", "Missing Solution": "Missing Solution"}
+              "Self-Assigned": "Self-Assigned", "Generic Solution": "Generic Solution", "Solution Mismatch": "Solution Mismatch", "Missing Solution": "Missing Solution"}
 
 st.set_page_config(
     page_title="TicketPulse IT v2.4 - Telemetry & Integrity Audit",
@@ -184,7 +184,7 @@ svg.ic {vertical-align: -3px; flex: none;}
 [data-testid="stFileUploader"] section, [data-testid="stFileUploaderDropzone"] {background: var(--card); border: 1px dashed var(--border2);
   border-radius: 10px; padding: 6px 10px; min-height: 0; align-items: center;}
 [data-testid="stFileUploaderDropzoneInstructions"] {display: none;}
-[data-testid="stFileUploaderDropzone"]::before {content: "Drop IT_Dump.xlsx or browse"; font: 400 12px 'JetBrains Mono', monospace;
+[data-testid="stFileUploaderDropzone"]::before {content: "Drop IT_Dump.xlsx or CSV, or browse"; font: 400 12px 'JetBrains Mono', monospace;
   color: var(--muted); margin-right: auto;}
 [data-testid="stFileUploaderDropzone"] button {font-size: 11px; padding: 3px 8px; border: 1px solid var(--border); color: var(--text);}
 [data-testid="stFileUploaderFile"] * {color: var(--text) !important;}
@@ -371,8 +371,15 @@ def demo_bytes() -> bytes:
 
 
 @st.cache_data(show_spinner=False)
-def process_excel_sheet(raw: bytes) -> pd.DataFrame:
-    df = pd.read_excel(BytesIO(raw))
+def process_excel_sheet(raw: bytes, filename: str = "upload.xlsx") -> pd.DataFrame:
+    """Load an Excel or CSV ticket export and apply conservative rule-based checks."""
+    if str(filename).lower().endswith(".csv"):
+        try:
+            df = pd.read_csv(BytesIO(raw), encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            df = pd.read_csv(BytesIO(raw), encoding="cp1252")
+    else:
+        df = pd.read_excel(BytesIO(raw))
 
     for col, default in {"Ticket ID": None, "Desk Agent": "Unassigned", "Category": "Uncategorized",
                          "Subject": "", "Created By": "Unknown", "Solution": np.nan}.items():
@@ -381,14 +388,48 @@ def process_excel_sheet(raw: bytes) -> pd.DataFrame:
     for col in ["Open Date", "Close Date", "Assign Date"]:
         df[col] = pd.to_datetime(df[col], errors="coerce") if col in df.columns else pd.NaT
 
+    # Calculate the full ticket lifetime from Open Date to Close Date.
+    # Do not use a pre-existing elapsed-duration field or Assign Date for this metric.
+    df["Open_To_Close_Sec"] = (df["Close Date"] - df["Open Date"]).dt.total_seconds()
+    df["Resolution_Min"] = df["Open_To_Close_Sec"] / 60.0
+    # Retain this separate metric for reference only; ticket duration is Open -> Close.
     df["Assign_To_Close_Sec"] = (df["Close Date"] - df["Assign Date"]).dt.total_seconds()
-    if "Elapsed Minutes" in df.columns:
-        df["Resolution_Min"] = pd.to_numeric(df["Elapsed Minutes"], errors="coerce")
-    else:
-        df["Resolution_Min"] = df["Assign_To_Close_Sec"] / 60.0
 
-    # Rule 1 - closed almost instantly
-    rule_fast = (df["Assign_To_Close_Sec"] < FAST_CLOSE_SEC) | (df["Resolution_Min"] < FAST_CLOSE_SEC / 60)
+    # Rule 1 - duration checks are task-aware. Physical/on-site work is excluded from
+    # duration-based suspicion because ticket timestamps do not measure travel/setup time reliably.
+    # Other tasks use conservative minimum plausible durations; these are review heuristics,
+    # not proof of fraud, and should be calibrated against the company's real workflow.
+    rule_fast = (df["Open_To_Close_Sec"] >= 0) & (df["Open_To_Close_Sec"] < FAST_CLOSE_SEC)
+
+    _physical_re = r"\b(physical|on[- ]?site|onsite|hardware|replace|replacement|repair|repaired|cable|wiring|printer jam|paper jam|toner|cartridge|screen|keyboard|mouse|monitor|motherboard|ram|memory module|hard drive|ssd|disk replacement|power supply|network port|patch panel|rack|server room|cleaning|dust|install printer hardware)\b"
+    _windows_re = r"\b(windows|operating system|\bos\b|format(?:ted|ting)?|reinstall(?:ed|ing)?|re-?install(?:ed|ing)?|image(?:d|ing)? the (?:pc|computer|laptop))\b"
+    _software_install_re = r"\b(install(?:ed|ing)?|deployment|deployed|setup|set up)\b.{0,45}\b(software|application|app|office|adobe|driver|vpn|antivirus|microsoft 365|teams|outlook)\b"
+    _account_re = r"\b(password reset|reset password|unlock(?:ed|ing)? account|account unlock|permission|access granted|access revoked|mailbox|email setup)\b"
+
+    def _duration_expectation(row):
+        task_text = " ".join(str(row.get(c, "")) for c in ("Subject", "Description", "Solution") if pd.notna(row.get(c, ""))).lower()
+        duration = row.get("Resolution_Min")
+        if pd.isna(duration) or duration < 0:
+            return (False, False, "")
+        if __import__("re").search(_physical_re, task_text):
+            return (False, True, "Physical/on-site task excluded from duration-based checks")
+        import re as _re
+        if _re.search(_windows_re, task_text):
+            minimum, task = 30.0, "OS/Windows installation or reinstallation"
+        elif _re.search(_software_install_re, task_text):
+            minimum, task = 5.0, "software/application installation"
+        elif _re.search(_account_re, task_text):
+            minimum, task = 1.0, "account/access operation"
+        else:
+            # General non-physical tickets closed in under one minute are worth reviewing,
+            # but only very task-specific thresholds create a stronger timing concern.
+            minimum, task = 1.0, "general IT task"
+        return (duration < minimum, False, f"{task} recorded as resolved in {duration:.1f} minute(s); review duration against actual work")
+
+    _timing = df.apply(_duration_expectation, axis=1)
+    df["Timing_Concern"] = [x[0] for x in _timing]
+    df["Physical_Task_Excluded"] = [x[1] for x in _timing]
+    df["Timing_Review_Note"] = [x[2] for x in _timing]
 
     # Rule 2 - empty / generic solution text
     generic_words = {"done", "ok", "fixed", "تم", "حل", "tam", "dne", "done.", "fixed.", "no", "na", "n/a", ".", ".."}
@@ -400,30 +441,78 @@ def process_excel_sheet(raw: bytes) -> pd.DataFrame:
         return len(s) <= 4 or s in generic_words
 
     rule_generic = df["Solution"].apply(is_generic)
+
+    # Rule 2b - flag clear cross-domain mismatches between the issue and documented solution.
+    # This is a conservative keyword heuristic, not semantic proof; only compare when both
+    # the issue and solution map confidently to different IT domains.
+    import re as _mismatch_re
+    _domain_patterns = {
+        "network": r"\b(vpn|wi-?fi|wireless|network|internet|router|dns|dhcp|ethernet|connectivity|firewall)\b",
+        "email": r"\b(outlook|email|e-mail|mailbox|exchange|teams meeting|microsoft 365|office 365)\b",
+        "account": r"\b(password|login|sign.?in|account lock|mfa|authentication|permission|access denied)\b",
+        "printer": r"\b(printer|printing|print queue|toner|paper jam)\b",
+        "camera": r"\b(cctv|camera|surveillance|nvr|dvr)\b",
+        "software": r"\b(adobe|acrobat|software|application|install|installation|license|winrar|pdf reader)\b",
+        "hardware": r"\b(laptop|desktop|monitor|keyboard|mouse|motherboard|ram|hard drive|ssd|hardware)\b",
+        "windows": r"\b(windows|operating system|boot|blue screen|bsod|os reinstall|format pc)\b",
+    }
+    def _domain(text):
+        text = str(text or "").lower()
+        found = [name for name, pattern in _domain_patterns.items() if _mismatch_re.search(pattern, text)]
+        return found[0] if len(found) == 1 else None
+    issue_text = df["Subject"].fillna("").astype(str)
+    if "Description" in df.columns:
+        issue_text = issue_text + " " + df["Description"].fillna("").astype(str)
+    issue_domains = issue_text.apply(_domain)
+    solution_domains = df["Solution"].fillna("").astype(str).apply(_domain)
+    rule_mismatch = issue_domains.notna() & solution_domains.notna() & (issue_domains != solution_domains)
+    df["Issue_Domain"] = issue_domains
+    df["Solution_Domain"] = solution_domains
+
     # Rule 3 - no solution text at all
-    rule_missing = df["Solution"].isna() | df["Solution"].astype(str).str.strip().eq("")
+    # Empty Solution is intentionally ignored: missing documentation alone is not proof of fraud.
+    rule_missing = pd.Series(False, index=df.index)
 
     # Rule 4 - self-assigned: the ticket creator and the desk agent are the same person
     norm = lambda col: df[col].astype(str).str.strip().str.lower()
-    rule_self = (norm("Created By") == norm("Desk Agent")) & df["Created By"].notna() & df["Desk Agent"].notna()
+    # Self-assignment alone is not evidence of fraud; do not score or flag it by default.
+    rule_self = pd.Series(False, index=df.index)
 
-    reasons, tags = [], []
-    for f, m, g, sa in zip(rule_fast, rule_missing, rule_generic, rule_self):
+    reasons, tags, suspicious = [], [], []
+    for i, (f, m, g, sa, mm) in enumerate(zip(rule_fast, rule_missing, rule_generic, rule_self, rule_mismatch)):
         r, t = [], []
-        if f:
-            r.append("Fast-Closed (<30s)"); t.append("Fast-Closed")
+        timing_concern = bool(df.iloc[i]["Timing_Concern"])
+        physical_excluded = bool(df.iloc[i]["Physical_Task_Excluded"])
+        timing_note = str(df.iloc[i]["Timing_Review_Note"] or "")
+        if physical_excluded:
+            r.append("Physical task excluded from time-based suspicion")
+        elif timing_concern:
+            r.append("Implausibly short duration - review required")
+            if timing_note:
+                r.append(timing_note)
+        elif f:
+            r.append("Very fast closure - contextual signal only")
         if sa:
-            r.append("Self-Assigned"); t.append("Self-Assigned")
+            r.append("Self-Assigned")
         if m:
-            r.append("Missing Solution Text"); t.append("Missing Solution")
+            r.append("Missing Solution Text")
         if g:
             r.append("Generic/Spam Solution"); t.append("Generic Solution")
-        reasons.append(" | ".join(r) if r else "Verified Genuine")
-        tags.append(t[0] if t else "Genuine")
+        if mm:
+            r.append(f"Solution Mismatch: issue={issue_domains.iloc[i]}, solution={solution_domains.iloc[i]}")
+            t.append("Solution Mismatch")
+        # Task-aware timing contributes only when a non-physical task is completed
+        # implausibly quickly. Physical tasks are excluded; empty Solution and Rating
+        # never affect this decision. The result is a review flag, not a final fraud finding.
+        is_suspicious = bool(g or mm or (timing_concern and not physical_excluded))
+        suspicious.append(is_suspicious)
+        # A clear issue/solution mismatch takes priority in the primary filter.
+        tags.append("Solution Mismatch" if mm else (t[0] if t else ("Fast-Closed" if (f or timing_concern) and not physical_excluded else "Genuine")))
+        reasons.append(" | ".join(r) if r else "No rule-based indicator found")
 
     df["Detection_Reason"] = reasons
     df["Primary_Flag"] = tags
-    df["Is_Fake"] = df["Primary_Flag"] != "Genuine"
+    df["Is_Fake"] = suspicious
     return df
 
 
@@ -463,7 +552,7 @@ with st.container(key="topbar"):
         md(f'<div class="brand"><span class="logo">{icon("pulse", 18)}</span><b>TicketPulse IT</b>'
            f'<span class="ver">v2.4 Live Telemetry</span></div>')
     with c[1]:
-        upload = st.file_uploader("Upload sheet", type=["xlsx", "xls"], label_visibility="collapsed", key="upload")
+        upload = st.file_uploader("Upload sheet", type=["xlsx", "xls", "csv"], label_visibility="collapsed", key="upload")
     with c[2]:
         st.button("Process & Analyze Sheet", type="primary", icon=":material/analytics:", key="process",
                   on_click=rerun_detection, **STRETCH)
@@ -484,7 +573,7 @@ else:
 
 t0 = time.perf_counter()
 try:
-    df = process_excel_sheet(raw)
+    df = process_excel_sheet(raw, fname)
 except Exception as exc:  # noqa: BLE001
     st.error(f"Could not read the spreadsheet: {exc}")
     st.stop()
@@ -575,7 +664,7 @@ def page_overview():
     diff = avg_min - SLA_TARGET_MIN if pd.notna(avg_min) else 0
     spd_chip = (f'<span class="chip {"g" if diff <= 0 else "r"}">{icon("down" if diff <= 0 else "up", 12)}'
                 f'{"-" if diff <= 0 else "+"}{fmt_dur(abs(diff)).split()[0]} vs SLA target</span>')
-    mix = [("var(--red)", tag_n["Fast-Closed"]), ("#8B8CF6", tag_n["Generic Solution"]), ("#F59E0B", tag_n["Self-Assigned"]), ("#94A3B8", tag_n["Missing Solution"])]
+    mix = [("var(--red)", tag_n["Fast-Closed"]), ("#8B8CF6", tag_n["Generic Solution"]), ("#F59E0B", tag_n["Self-Assigned"]), ("#94A3B8", tag_n["Missing Solution"]), ("#F97316", tag_n["Solution Mismatch"])]
     mix_bar = "".join(f'<i style="width:{v / max(fake_n, 1) * 100:.1f}%;background:{c}"></i>' for c, v in mix)
     md(f'''<div class="kpi-grid">
 <div class="kpi"><div class="kpi-h"><span>Total Tickets Ingested</span>{icon("inbox", 18)}</div>
@@ -628,7 +717,7 @@ def page_overview():
                      f'<div class="bar"><i style="width:{100 - rate:.1f}%;background:var(--green)"></i>'
                      f'<i style="width:{rate:.1f}%;background:var(--red)"></i></div></div>')
     parts = [("Genuine", genuine_n, "var(--green)"), ("Generic", tag_n["Generic Solution"], "#8B8CF6"),
-             ("Fast-Closed", tag_n["Fast-Closed"], "#FB7185"), ("Self-Assigned", tag_n["Self-Assigned"], "#F59E0B"), ("Missing", tag_n["Missing Solution"], "#94A3B8")]
+             ("Fast-Closed", tag_n["Fast-Closed"], "#FB7185"), ("Self-Assigned", tag_n["Self-Assigned"], "#F59E0B"), ("Missing", tag_n["Missing Solution"], "#94A3B8"), ("Solution Mismatch", tag_n["Solution Mismatch"], "#F97316")]
     legend = "".join(f'<span><i style="background:{c}"></i>{n} ({v / total * 100:.1f}%)</span>' for n, v, c in parts)
     md(f'''<div class="mid">
 <div class="card"><div class="sec-h"><div><div class="sec-t">{icon("users", 20)}Employee Leaderboard &amp; Risk Audit</div>
@@ -772,13 +861,15 @@ def page_agents():
 def page_rules():
     page_header("Rules Engine", "The checks that decide whether a closed ticket is flagged.")
     md(f'''<div class="card"><div class="nm" style="font-size:14px">Fast-Closed</div>
-<div class="sec-s">Assign-to-close time under {FAST_CLOSE_SEC} seconds, or a logged duration under {FAST_CLOSE_SEC / 60:.1f} minutes.</div>
+<div class="sec-s">A closure under {FAST_CLOSE_SEC} seconds is shown as a timing review signal only. Time alone does not classify a ticket as fake; another independent indicator is needed.</div>
 <div class="nm" style="font-size:14px;margin-top:16px">Self-Assigned</div>
-<div class="sec-s">The ticket creator (Created By) and the desk agent are the same person.</div>
+<div class="sec-s">Disabled by default. Creator/agent matching alone is not treated as evidence of fraud.</div>
 <div class="nm" style="font-size:14px;margin-top:16px">Missing Solution</div>
-<div class="sec-s">The solution field is empty.</div>
+<div class="sec-s">Ignored by design. An empty Solution field does not increase risk or flag a ticket.</div>
 <div class="nm" style="font-size:14px;margin-top:16px">Generic Solution</div>
 <div class="sec-s">The solution is 4 characters or fewer, or a known filler such as "done", "ok" or "fixed".</div>
+<div class="nm" style="font-size:14px;margin-top:16px">Solution Mismatch</div>
+<div class="sec-s">Flags a ticket when the issue and solution clearly map to different IT domains (for example, a VPN issue documented as an Adobe installation). This is a keyword-based review signal, not proof of fraud.</div>
 <div class="nm" style="font-size:14px;margin-top:16px">Agent audit status</div>
 <div class="sec-s">Critical Flag above 20% suspicious, Under Review above {ANOMALY_THRESHOLD:.0f}%, Exemplary below 1%,
 Compliant up to 3%, otherwise Normal.</div></div>''')
