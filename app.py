@@ -17,7 +17,7 @@ import streamlit as st
 # =========================================================
 # 0. Settings you may want to edit
 # =========================================================
-DEFAULT_FILE = "Closed_Tickets_20261017_160931.xlsx"   # used when nothing is uploaded
+DEFAULT_FILE = ""   # used when nothing is uploaded
 TICKET_PREFIX = "#IT-"
 SLA_TARGET_MIN = 25.0        # SLA target shown on the speed card (minutes)
 FAST_CLOSE_SEC = 30          # tickets closed faster than this are "Fast-Closed"
@@ -566,10 +566,13 @@ with st.container(key="topbar"):
 # =========================================================
 if upload is not None:
     raw, fname = upload.getvalue(), upload.name
-elif Path(DEFAULT_FILE).exists():
+elif DEFAULT_FILE and Path(DEFAULT_FILE).exists():
     raw, fname = Path(DEFAULT_FILE).read_bytes(), DEFAULT_FILE
 else:
-    raw, fname = demo_bytes(), "Demo_Helpdesk_Log.xlsx"
+    st.title("Upload your ticket data")
+    st.write("Upload an Excel or CSV file to start the ticket integrity analysis. No demo data is loaded automatically.")
+    st.info("Supported formats: .xlsx, .xls, .csv")
+    st.stop()
 
 t0 = time.perf_counter()
 try:
